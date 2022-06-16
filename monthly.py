@@ -33,17 +33,31 @@ class MonthlyProphetForecast:
         cap=None,
         seasonality_mode="multiplicative",
         plot_confidence_interval=False,
+        months=None,
+        interval_width=0.8,
+        backtest=None,
         *args,
         **kwargs
     ):
         self.df = df
-        self.sim_start = self.df.index.max()
         self.column = column
         self.cap = cap
         self.forecast_periods = forecast_periods
         self.seasonality_mode = seasonality_mode
         self.plot_confidence_interval = plot_confidence_interval
+        self.months = (
+            MONTHS
+            if months is None
+            else {k: v for k, v in MONTHS.items() if k in months}
+        )
+        self.interval_width = interval_width
+        self.backtest = backtest
+        self.interval_label = self._format_percentage((1 - interval_width) / 2)
+        # self._excluded_months = [
+        #     MONTHS[i] for i in MONTHS.keys() if i not in self.months.keys()
+        # ]
         self.model_df = self.prepare_df(self.df, self.column, self.cap)
+        self.sim_start = self.model_df.index.max()
         self.m = self.fit_prophet_model(self.model_df, self.cap, *args, **kwargs)
 
         if self.cap:
@@ -64,6 +78,8 @@ class MonthlyProphetForecast:
 
     def prepare_df(self, df, column, cap):
         model_df = df.copy()
+        if self.backtest is not None:
+            model_df = model_df.loc[: self.backtest]
         model_df = model_df[[column]]
         model_df["ds"] = model_df.index
         model_df.columns = ["y", "ds"]
@@ -78,10 +94,13 @@ class MonthlyProphetForecast:
         m = Prophet(
             yearly_seasonality=False,
             seasonality_mode=self.seasonality_mode,
+            interval_width=self.interval_width,
             *args,
             **kwargs
         )
-        [m.add_regressor(month) for month in MONTHS.keys()]
+        [m.add_regressor(month) for month in self.months.keys()]
+        # if len(self._excluded_months) > 0:
+        #     m.add_regressor("Overall")
         m.fit(df)
         return m
 
@@ -103,17 +122,36 @@ class MonthlyProphetForecast:
     def get_seasonal_df(self):
         seasonality = [
             {"Month": month, "Value": self._get_seasonal_value(self.forecast[month])}
-            for month in MONTHS
+            for month in self.months
         ]
+        # if len(self._excluded_months) > 0:
+        #     seasonality.append(
+        #         {
+        #             "Month": "Overall",
+        #             "Value": self._get_seasonal_value(self.forecast["Overall"]),
+        #         }
+        #     )
         seasonal_df = pd.DataFrame(seasonality)
         if self.seasonality_mode != "multiplicative":
             self.seasonal_adjust = seasonal_df["Value"].mean()
             self.forecast["trend"] = self.forecast["trend"] + self.seasonal_adjust
+            self.forecast["trend_lower"] = (
+                self.forecast["trend_lower"] + self.seasonal_adjust
+            )
+            self.forecast["trend_upper"] = (
+                self.forecast["trend_upper"] + self.seasonal_adjust
+            )
             seasonal_df["Value"] = seasonal_df["Value"] - self.seasonal_adjust
         else:
             seasonal_df["Value"] = seasonal_df["Value"] + 1
             self.seasonal_adjust = seasonal_df["Value"].mean()
             self.forecast["trend"] = self.forecast["trend"] * self.seasonal_adjust
+            self.forecast["trend_lower"] = (
+                self.forecast["trend_lower"] * self.seasonal_adjust
+            )
+            self.forecast["trend_upper"] = (
+                self.forecast["trend_upper"] * self.seasonal_adjust
+            )
             seasonal_df["Value"] = seasonal_df["Value"] / self.seasonal_adjust
         return seasonal_df
 
@@ -135,7 +173,7 @@ class MonthlyProphetForecast:
         fig = go.Figure()
         fig.add_scattergl(
             x=self.plot_df.index,
-            y=self.plot_df[self.column].where(self.plot_df.index <= self.sim_start),
+            y=self.plot_df[self.column],
             line={"color": "#091E42"},
             name="Actual",
         )
@@ -156,13 +194,13 @@ class MonthlyProphetForecast:
                 x=self.plot_df.index,
                 y=self.plot_df.yhat_lower.where(self.plot_df.index > self.sim_start),
                 line={"color": "#C1C7D0", "dash": "dash"},
-                name="10%",
+                name=self.interval_label,
             )
             fig.add_scattergl(
                 x=self.plot_df.index,
                 y=self.plot_df.yhat_upper.where(self.plot_df.index > self.sim_start),
                 line={"color": "#C1C7D0", "dash": "dash"},
-                name="10%",
+                name=self.interval_label,
             )
         fig.update_layout(
             legend=dict(
@@ -207,13 +245,13 @@ class MonthlyProphetForecast:
                 x=self.forecast.index,
                 y=self.forecast.trend_lower.where(self.forecast.index > self.sim_start),
                 line={"color": "#C1C7D0", "dash": "dash"},
-                name="10%",
+                name=self.interval_label,
             )
             fig.add_scattergl(
                 x=self.forecast.index,
                 y=self.forecast.trend_upper.where(self.forecast.index > self.sim_start),
                 line={"color": "#C1C7D0", "dash": "dash"},
-                name="10%",
+                name=self.interval_label,
             )
 
         fig.update_layout(
@@ -234,8 +272,12 @@ class MonthlyProphetForecast:
         return fig
 
     def _append_month_cols(self, df):
-        for month in MONTHS:
-            df[month] = (df["ds"].dt.month == MONTHS[month]).values.astype("float")
+        for month in self.months:
+            df[month] = (df["ds"].dt.month == self.months[month]).values.astype("float")
+        # if len(self._excluded_months) > 0:
+        #     df["Overall"] = (
+        #         df["ds"].dt.month.isin(self._excluded_months)
+        #     ).values.astype("float")
         return df
 
     def _get_seasonal_value(self, col):
@@ -243,3 +285,6 @@ class MonthlyProphetForecast:
         if len(values) != 1:
             raise ValueError("More than one unique value for season")
         return values[0]
+
+    def _format_percentage(self, num):
+        return "{:.0%}".format(num)
